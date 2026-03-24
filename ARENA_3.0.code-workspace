@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "ARENA_3.0",
+			"path": "."
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "${workspaceFolder:ARENA_3.0}/.venv/bin/python3.11",
+		"python.analysis.typeCheckingMode": "basic",
+		"workbench.colorCustomizations": {
+			"titleBar.activeBackground": "#440000",
+			"titleBar.inactiveBackground": "#440000",
+			"activityBar.background": "#440000",
+		}
+	}
+}
