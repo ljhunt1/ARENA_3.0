@@ -1,0 +1,796 @@
+#%%
+import json
+import sys
+from collections import namedtuple
+from dataclasses import dataclass
+from pathlib import Path
+
+import einops
+import numpy as np
+import torch as t
+import torch.nn as nn
+import torch.nn.functional as F
+import torchinfo
+from IPython.display import display
+from jaxtyping import Float, Int
+from PIL import Image
+from rich import print as rprint
+from rich.table import Table
+from torch import Tensor
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, models, transforms
+from tqdm.notebook import tqdm
+import solutions
+import typing
+
+# Make sure exercises are in the path
+chapter = "chapter0_fundamentals"
+section = "part2_cnns"
+root_dir = next(p for p in Path.cwd().parents if (p / chapter).exists())
+exercises_dir = root_dir / chapter / "exercises"
+section_dir = exercises_dir / section
+if str(exercises_dir) not in sys.path:
+    sys.path.append(str(exercises_dir))
+
+MAIN = __name__ == "__main__"
+
+import part2_cnns.tests as tests
+import part2_cnns.utils as utils
+from plotly_utils import line
+
+
+# %%
+class ReLU(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return t.maximum(x, t.zeros_like(x))
+
+tests.test_relu(ReLU)
+# %%
+class Linear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = bias
+
+        sf = 1 / np.sqrt(in_features)
+
+        # initialize W uniformly in [-sqrt(in_features), sqrt(in_features)]
+        self.weight = nn.Parameter(t.rand(size=(out_features, in_features)) * 2*sf - sf)
+        if bias:
+            self.bias = nn.Parameter(t.rand(size=[out_features]) * 2*sf - sf)
+        else:
+            self.bias = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = einops.einsum(self.weight, x, 'out in, ... in -> ... out') 
+        if self.bias is not None:
+            out += self.bias
+        return out
+    
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+    
+# %%
+class Flatten(nn.Module):
+    def __init__(self, start_dim: int = 1, end_dim: int = -1) -> None:
+        super().__init__()
+        self.start_dim = start_dim
+        self.end_dim = end_dim
+
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Flatten out dimensions from start_dim to end_dim, inclusive of both.
+        """
+        shape = input.shape
+
+        # Get start & end dims, handling negative indexing for end dim
+        start_dim = self.start_dim
+        end_dim = self.end_dim if self.end_dim >= 0 else len(shape) + self.end_dim
+
+        # Get the shapes to the left / right of flattened dims, as well as size of flattened middle
+        shape_left = shape[:start_dim]
+        shape_right = shape[end_dim + 1 :]
+        shape_middle = t.prod(t.tensor(shape[start_dim : end_dim + 1])).item()
+
+        return t.reshape(input, shape_left + (shape_middle,) + shape_right)
+
+    def extra_repr(self) -> str:
+        return ", ".join([f"{key}={getattr(self, key)}" for key in ["start_dim", "end_dim"]])
+    
+
+# %%
+# 1 layer MLP, configurable
+class MLP_1hidden(nn.Module):
+    def __init__(self, in_features: int, out_features: int, hidden_features: int, nonlin: nn.Module):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.hidden_features = hidden_features
+
+        self.linear1 = Linear(in_features=in_features, out_features=hidden_features)
+        self.nonlin = nonlin
+        self.linear2 = Linear(in_features=hidden_features, out_features=out_features)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear2(self.nonlin(self.linear1(x)))
+    
+# 1 layer MLP with flattening. Takes a 28x28 tensor, 100-feature hidden layer, 10 output logits
+class SimpleMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flatten = Flatten()
+        self.linear1 = Linear(in_features=28*28, out_features=100)
+        self.relu = ReLU()
+        self.linear2 = Linear(in_features=100, out_features=10)
+
+    def forward(self, x: Tensor):
+        return self.linear2(self.relu(self.linear1(self.flatten(x))))
+
+tests.test_mlp_module(SimpleMLP)
+tests.test_mlp_forward(SimpleMLP)
+# %%
+MNIST_TRANSFORM = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Normalize(0.1307, 0.3081)
+    ]
+)
+
+def get_mnist(trainset_size: int = 10_000, testset_size: int = 1_000) -> tuple[Subset, Subset]:
+    """Returns a subset of MNIST training data."""
+
+    # Get original datasets, which are downloaded to "./data" for future use
+    mnist_trainset = datasets.MNIST(exercises_dir / "data", train=True, download=True, transform=MNIST_TRANSFORM)
+    mnist_testset = datasets.MNIST(exercises_dir / "data", train=False, download=True, transform=MNIST_TRANSFORM)
+
+    # # Return a subset of the original datasets
+    mnist_trainset = Subset(mnist_trainset, indices=range(trainset_size))
+    mnist_testset = Subset(mnist_testset, indices=range(testset_size))
+
+    return mnist_trainset, mnist_testset
+
+mnist_trainset, mnist_testset = get_mnist()
+mnist_trainloader = DataLoader(mnist_trainset, batch_size=64, shuffle=True)
+mnist_testloader = DataLoader(mnist_testset, batch_size=64, shuffle=False)
+
+for img_batch, label_batch in mnist_testloader:
+    print(f"{img_batch.shape=}\n{label_batch.shape=}\n")
+    break
+
+for img, label in mnist_testset:
+    print(f"{img.shape=}\n{label=}\n")
+    break
+
+t.testing.assert_close(img, img_batch[0])
+assert label == label_batch[0].item()
+
+# %%
+from tqdm.notebook import tqdm
+import time
+
+for i in tqdm(range(100)):
+    time.sleep(0.1)
+
+# %%
+device = t.device("mps") if t.mps.is_available() else t.device("cuda") if t.cuda.is_available() else "cpu"
+# %%
+model = SimpleMLP().to(device)
+
+batch_size = 128
+epochs = 3
+
+mnist_trainset, _ = get_mnist()
+mnist_trainloader = DataLoader(mnist_trainset, batch_size=batch_size, shuffle=True)
+
+optimizer = t.optim.Adam(model.parameters(), lr=1e-3)
+loss_list = []
+
+for epoch in range(epochs):
+    pbar = tqdm(mnist_trainloader)
+
+    for imgs, labels in pbar:
+        imgs, labels = imgs.to(device), labels.to(device)
+        logits = model(imgs)
+
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        loss_list.append(loss.item())
+        pbar.set_postfix(epoch=f"{epoch + 1}/{epochs}", loss=f"{loss:.3f}")
+
+
+line(
+    loss_list,
+    x_max = epochs * len(mnist_trainset),
+    labels={"x": "Examples seen", "y": "Cross entropy loss"},
+    title="SimpleMLP training on MNIST",
+    width=700
+)
+# %%
+# another try, with validation
+@dataclass
+class SimpleMLPTrainingArgs:
+    batch_size: int = 128
+    epochs: int = 10
+    learning_rate: float = 1e-3
+    device: t.device = t.device("mps")
+
+
+
+def train(args: SimpleMLPTrainingArgs) -> tuple[list[float], list[float], SimpleMLP]:
+    model = SimpleMLP().to(args.device)
+
+    mnist_trainset, mnist_testset = get_mnist()
+    mnist_trainloader = DataLoader(mnist_trainset, batch_size=args.batch_size, shuffle=True)
+    mnist_testloader = DataLoader(mnist_testset, batch_size=args.batch_size, shuffle=False)
+
+    optimizer = t.optim.Adam(model.parameters(), lr=args.learning_rate)
+    training_loss_list=[]
+    test_accuracy_list=[]
+
+    # ugly: we want to do this up front and once after each epoch, so just make a nested function for it
+    def compute_test_accuracy():
+        with t.inference_mode():
+            count_correct = 0
+            for imgs, labels in mnist_testloader:
+                imgs, labels = imgs.to(args.device), labels.to(args.device)
+                logits = model(imgs)
+                choice = t.argmax(logits, dim=1)
+                count_correct += ((choice == labels).sum())
+            test_accuracy_list.append((count_correct) / len(mnist_testset))
+    
+    compute_test_accuracy()
+
+    for epoch in range(args.epochs):
+        pbar = tqdm(mnist_trainloader)
+        for imgs, labels in pbar:
+            imgs, labels = imgs.to(args.device), labels.to(args.device)
+            logits = model(imgs)
+
+            loss = F.cross_entropy(logits, labels)
+            loss.backward()
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            training_loss_list.append(loss.item())
+            pbar.set_postfix(epoch=f"{epoch + 1}/{args.epochs}", loss=f"{loss:.3f}")
+
+        compute_test_accuracy()
+    
+    return (training_loss_list, test_accuracy_list, model)
+
+            
+# %%
+device = t.device("mps") if t.mps.is_available() else t.device("cuda") if t.cuda.is_available() else t.device("cpu")
+args = SimpleMLPTrainingArgs(batch_size=64, epochs=10, learning_rate=1e-3, device=device)
+
+training_loss_list, test_accuracy_list, model = train(args)
+
+line(
+    training_loss_list,
+    x_max = args.epochs * len(mnist_trainset),
+    labels={"x": "Examples seen", "y": "Cross entropy loss"},
+    title="SimpleMLP training on MNIST",
+    width=700
+)
+line(
+    test_accuracy_list,
+    x_max = args.epochs,
+    labels={"x": "Examples seen", "y": "Test accuracy"},
+    title="SimpleMLP training on MNIST",
+    width=700
+)
+# %%
+"""
+Same as torch.nn.Conv2d with bias=False.
+We assume kernel is square, with height = width = `kernel_size`.
+"""
+class Conv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int = 0, stride: int = 1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+
+        # uniform kaiming initialization
+        sf = 1/np.sqrt(self.in_channels * self.kernel_size * self.kernel_size)
+        self.weight = nn.Parameter(t.rand(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size) * 2 * sf - sf)
+
+        # self.conv = nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.padding, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return t.nn.functional.conv2d(x, self.weight, stride=self.stride, padding=self.padding)
+    
+    def extra_repr(self) -> str:
+        keys = ["in_channels", "out_channels", "kernel_size", "stride", "padding"]
+        return ", ".join([f"{key}={getattr(self, key)}" for key in keys])
+    
+tests.test_conv2d_module(Conv2d)
+m = Conv2d(in_channels=24, out_channels=12, kernel_size=3, stride=2, padding=1)
+print(f"Manually verify that this is an informative repr: {m}")
+# %%
+class MaxPool2d(nn.Module):
+    def __init__(self, kernel_size: int, stride: int | None = None, padding: int = 1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Call the functional version of maxpool2d."""
+        return F.max_pool2d(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+
+    def extra_repr(self) -> str:
+        """Add additional information to the string representation of this class."""
+        return ", ".join([f"{key}={getattr(self, key)}" for key in ["kernel_size", "stride", "padding"]])
+    
+
+# %%
+class Sequential(nn.Module):
+    _modules: dict[str, nn.Module]
+
+    def __init__(self, *modules: nn.Module):
+        super().__init__()
+        for index, mod in enumerate(modules):
+            self._modules[str(index)] = mod
+
+    def __getitem__(self, index: int) -> nn.Module:
+        index %= len(self._modules)  # deal with negative indices
+        return self._modules[str(index)]
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Chain each module together, with the output from one feeding into the next one."""
+        for mod in self._modules.values():
+            x = mod(x)
+        return x
+        
+
+# %%
+# Apply batch norm over a 4D input (mini_batch, channel, height, width)
+class BatchNorm2d(nn.Module):
+    # type annotations because nn.Module.register_buffer sets the item on the object but the type checker doesn't know that
+    running_mean: Float[Tensor, "num_features"]
+    running_var: Float[Tensor, "num_features"]
+    num_batches_tracked: Int[Tensor, ""]
+
+    # which parameters are intrinsic to this? 
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+
+        self.register_buffer("running_mean", t.zeros(num_features))
+        self.register_buffer("running_var", t.ones(num_features))
+        self.register_buffer("num_batches_tracked", t.tensor(0))
+        
+        self.weight = nn.Parameter(t.ones(num_features))
+        self.bias = nn.Parameter(t.zeros(num_features))
+
+    # (batch, channel, height, width)
+    def forward(self, x: Tensor) -> Tensor:
+        reshape = lambda k : einops.rearrange(k, 'num_features -> num_features 1 1')
+        if self.training:
+            batch_mean: Float[Tensor, "num_features"] = x.mean(dim=(0, 2, 3))
+            batch_var: Float[Tensor, "num_features"] = x.var(dim=(0, 2, 3), correction=0)
+
+            # update running mean, var. "momentum" is fucking backwards here
+            self.running_mean = (1-self.momentum)*self.running_mean + self.momentum*batch_mean
+            self.running_var = (1-self.momentum)*self.running_var + self.momentum*batch_var
+            self.num_batches_tracked += 1
+
+            normed = (x - reshape(batch_mean)) / t.sqrt((reshape(batch_var)) + self.eps)
+            return normed * reshape(self.weight) + reshape(self.bias)
+        else:
+            normed = (x - reshape(self.running_mean)) / t.sqrt((reshape(self.running_var) + self.eps))
+            return normed * reshape(self.weight) + reshape(self.bias)
+
+tests.test_batchnorm2d_module(BatchNorm2d)
+tests.test_batchnorm2d_forward(BatchNorm2d)
+tests.test_batchnorm2d_running_mean(BatchNorm2d)
+
+# %%
+class AveragePool(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return einops.reduce(x, 'batch channels height width -> batch channels', 'mean')
+tests.test_averagepool(AveragePool)
+# %%
+class ResidualBlock(nn.Module):
+    def __init__(self, in_feats: int, out_feats: int, first_stride=1):
+        self.in_feats = in_feats
+        self.out_feats = out_feats
+        self.first_stride = first_stride
+        """
+        A single residual block with optional downsampling.
+
+        For compatibility with the pretrained model, declare the left side branch first using a
+        `Sequential`.
+
+        If first_stride is > 1, this means the optional (conv + bn) should be present on the right
+        branch. Declare it second using another `Sequential`.
+        """
+        super().__init__()
+        self.left = nn.Sequential(
+            Conv2d(in_channels=in_feats, out_channels=out_feats, kernel_size=3, stride=first_stride, padding=1),
+            BatchNorm2d(num_features=out_feats),
+            ReLU(),
+            Conv2d(in_channels=out_feats, out_channels=out_feats, kernel_size=3, stride=1, padding=1),
+            BatchNorm2d(num_features=out_feats)
+        )
+        is_shape_preserving = (first_stride == 1) and (in_feats == out_feats)  # determines if right branch is identity
+        self.right = nn.Identity() if is_shape_preserving else Sequential(
+            Conv2d(in_channels=in_feats, out_channels=out_feats, kernel_size=1, stride=first_stride, padding=0),
+            BatchNorm2d(num_features=out_feats)
+        )
+        self.relu = ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.relu(self.left(x) + self.right(x))
+
+
+tests.test_residual_block(ResidualBlock)
+
+#%%
+class BlockGroup(nn.Module):
+    def __init__(self, n_blocks: int, in_feats: int, out_feats: int, first_stride=1):
+        super().__init__()
+        self.first_stride = first_stride
+        first_block = ResidualBlock(in_feats=in_feats, out_feats=out_feats, first_stride=self.first_stride)
+        self.blocks = Sequential(
+            first_block,
+            *[ResidualBlock(in_feats=out_feats, out_feats=out_feats, first_stride=1) for _ in range(n_blocks-1)]
+        )
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.blocks(x)
+    
+tests.test_block_group(BlockGroup)
+
+#%%
+
+class ResNet34(nn.Module):
+    def __init__(
+        self,
+        n_blocks_per_group=[3, 4, 6, 3],
+        out_features_per_group=[64, 128, 256, 512],
+        first_strides_per_group=[1, 2, 2, 2],
+        n_classes=1000
+    ):
+        assert(len(n_blocks_per_group) == len(out_features_per_group) 
+               and len(out_features_per_group) == len(first_strides_per_group))
+        super().__init__()
+        n_groups = len(n_blocks_per_group)
+        out_feats0 = 64
+        self.n_blocks_per_group = n_blocks_per_group
+        self.out_features_per_group = out_features_per_group
+        self.first_strides_per_group = first_strides_per_group
+        self.n_classes = n_classes
+        self.sequential = nn.Sequential(
+            Conv2d(in_channels=3, out_channels=out_feats0, kernel_size=7, padding=3, stride=2),
+            BatchNorm2d(num_features=out_feats0),
+            ReLU(),
+            MaxPool2d(kernel_size=3, stride=2, padding=1),
+            *[
+                BlockGroup(n_blocks=n_blocks_per_group[i],
+                           in_feats=out_feats0 if i==0 else out_features_per_group[i-1],
+                           out_feats=out_features_per_group[i],
+                           first_stride=first_strides_per_group[i]
+                           ) for i in range(n_groups)
+            ],
+            AveragePool(),
+            Linear(in_features=out_features_per_group[-1], out_features=n_classes),
+        )
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.sequential(x)
+
+
+my_resnet = ResNet34()
+target_resnet = models.resnet34()
+# utils.print_param_count(my_resnet, target_resnet)
+
+print("My model:", torchinfo.summary(my_resnet, input_size=(1, 3, 64, 64)), sep="\n")
+print(
+    "\nReference model:",
+    torchinfo.summary(target_resnet, input_size=(1, 3, 64, 64), depth=2),
+    sep="\n",
+)
+
+#%%
+def copy_weights(my_resnet: ResNet34, pretrained_resnet: models.resnet.ResNet) -> ResNet34:
+    """Copy over the weights of `pretrained_resnet` to your resnet."""
+
+    # Get the state dictionaries for each model, check they have the same number of parameters &
+    # buffers
+    mydict = my_resnet.state_dict()
+    pretraineddict = pretrained_resnet.state_dict()
+    assert len(mydict) == len(pretraineddict), "Mismatching state dictionaries."
+
+    # Define a dictionary mapping the names of your parameters / buffers to their values in the
+    # pretrained model
+    state_dict_to_load = {
+        mykey: pretrainedvalue
+        for (mykey, myvalue), (pretrainedkey, pretrainedvalue) in zip(mydict.items(), pretraineddict.items())
+    }
+
+    # Load in this dictionary to your model
+    my_resnet.load_state_dict(state_dict_to_load)
+
+    return my_resnet
+
+
+pretrained_resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1).to(device)
+my_resnet = copy_weights(my_resnet, pretrained_resnet).to(device)
+print("Weights copied successfully!")
+
+#%%
+IMAGE_FILENAMES = [
+    "chimpanzee.jpg",
+    "golden_retriever.jpg",
+    "platypus.jpg",
+    "frogs.jpg",
+    "fireworks.jpg",
+    "astronaut.jpg",
+    "iguana.jpg",
+    "volcano.jpg",
+    "goofy.jpg",
+    "dragonfly.jpg",
+]
+
+IMAGE_FOLDER = section_dir / "resnet_inputs"
+
+images = [Image.open(IMAGE_FOLDER / filename) for filename in IMAGE_FILENAMES]
+
+#%%
+IMAGE_SIZE=224
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+IMAGENET_TRANSFORM = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+])
+
+prepared_images = t.stack([IMAGENET_TRANSFORM(img) for img in images], dim=0).to(device)
+assert prepared_images.shape == (len(images), 3, IMAGE_SIZE, IMAGE_SIZE)
+
+#%%
+# Verify model predictions
+
+@t.inference_mode
+def predict(model: nn.Module, images: Float[Tensor, "batch rgb h w"]) -> tuple[Float[Tensor, " batch"], Int[Tensor, " batch"]]:
+    model.eval()
+    logits = model(images)
+    probabilities = t.softmax(logits, dim=1)
+    return t.max(probabilities, dim=1)
+
+with open(section_dir / "imagenet_labels.json") as f:
+    imagenet_labels = list(json.load(f).values())
+
+my_probs, my_predictions = predict(my_resnet, prepared_images)
+pretrained_probs, pretrained_predictions = predict(pretrained_resnet, prepared_images)
+# %%
+assert (my_predictions == pretrained_predictions).all()
+t.testing.assert_close(my_probs, pretrained_probs, atol=5e-4, rtol=0)
+
+for i, img in enumerate(images):
+    table = Table("Model", "Prediction", "Probability")
+    table.add_row("My ResNet", imagenet_labels[my_predictions[i]], f"{my_probs[i]:.3%}")
+    table.add_row(
+        "Reference Model",
+        imagenet_labels[pretrained_predictions[i]],
+        f"{pretrained_probs[i]:.3%}",
+    )
+    rprint(table)
+    display(img)
+
+
+# %%
+# Practicing forward hooks
+
+class NanModule(nn.Module):
+    def forward(self, x):
+        return t.full_like(x, float("nan"))
+    
+def hook_check_for_nan_output(module: nn.Module, input: list[Tensor], output: Tensor) -> None:
+    if t.isnan(input).any():
+        raise ValueError(f"NaN output from {module}")
+
+def add_hook(module: nn.Module):
+    module.register_forward_hook(hook_check_for_nan_output)
+def remove_hooks(module: nn.Module):
+    module._forward_hooks.clear()
+    module._forward_pre_hooks.clear()
+    module._backward_hooks.clear()
+
+# %%
+model = nn.Sequential(nn.Identity(), NanModule(), nn.Identity())
+model = model.apply(add_hook)
+
+try:
+    input=t.randn(3)
+    output = model(input)
+except ValueError as e:
+    print(e)
+
+model = model.apply(remove_hooks)
+output = model(input)
+print(output)
+# %%
+
+# %%
+# Feature extraction: freeze the conv base of the model, train a new feature classifier
+
+def get_resnet34_for_feature_extraction(n_classes: int) -> ResNet34:
+    my_resnet = ResNet34()
+    pretrained_resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+    my_resnet = copy_weights(my_resnet, pretrained_resnet)
+
+    # freeze gradients for all layers
+    my_resnet.requires_grad_(False)
+
+    my_resnet.sequential[-1] = Linear(my_resnet.out_features_per_group[-1], n_classes)
+    return my_resnet
+
+
+# %%
+def get_cifar() -> tuple[datasets.CIFAR10, datasets.CIFAR10]:
+    """Returns CIFAR-10 train and test sets."""
+    cifar_trainset = datasets.CIFAR10(exercises_dir / "data", train=True, download=True, transform=IMAGENET_TRANSFORM)
+    cifar_testset = datasets.CIFAR10(exercises_dir / "data", train=False, download=True, transform=IMAGENET_TRANSFORM)
+    return cifar_trainset, cifar_testset
+
+
+@dataclass
+class ResNetTrainingArgs:
+    batch_size: int = 64
+    epochs: int = 5
+    learning_rate: float = 1e-3
+    n_classes: int = 10
+# %%
+from torch.utils.data import Subset
+def get_cifar_subset(trainset_size: int = 10_000, testset_size: int = 1_000) -> tuple[Subset, Subset]:
+    """Returns a subset of CIFAR-10 train & test sets (slicing the first examples)."""
+    cifar_trainset, cifar_testset = get_cifar()
+    return Subset(cifar_trainset, range(trainset_size)), Subset(cifar_testset, range(testset_size))
+
+
+def train(args: ResNetTrainingArgs) -> tuple[list[float], list[float], ResNet34]:
+    """
+    Performs feature extraction on ResNet, returning the model & lists of loss and accuracy.
+    """
+    model = get_resnet34_for_feature_extraction(n_classes=10)
+    # grab a trainset of size 10k, testset of size 1k. Everything will use this
+    trainset, testset = get_cifar_subset()
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True)
+    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False)
+    optimizer = t.optim.Adam(model.sequential[-1].parameters(), lr=args.learning_rate)
+
+    batch_train_losses = []
+    epoch_test_accuracies = []
+    model.to(device=device)
+
+    # training loop
+    for epoch in range(args.epochs):
+        model.train()
+        pbar = tqdm(trainloader)
+        for batch_imgs, batch_labels in pbar:
+            # move to device, do forward pass
+            batch_imgs, batch_labels = batch_imgs.to(device), batch_labels.to(device)
+            logits = model(batch_imgs)
+
+            # get loss, backwards pass
+            loss = F.cross_entropy(logits, batch_labels)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            batch_train_losses.append(loss.item())
+        
+        # test accuracy
+        model.eval()
+        test_matches = 0
+        for batch_imgs, batch_labels in testloader:
+            batch_imgs, batch_labels = batch_imgs.to(device), batch_labels.to(device)
+            with t.inference_mode():
+                logits = model(batch_imgs)
+            labels = t.argmax(logits, dim=1)
+            test_matches += (labels == batch_labels).sum().item()
+        epoch_test_accuracies.append(float(test_matches) / len(testset))
+
+
+    return batch_train_losses, epoch_test_accuracies, model
+
+
+    raise NotImplementedError()
+
+
+args = ResNetTrainingArgs()
+loss_list, accuracy_list, model = train(args)
+
+#%%
+args = ResNetTrainingArgs()
+line(
+    y=[
+        loss_list,
+        [1 / args.n_classes] + accuracy_list,
+    ],  # we start by assuming a uniform accuracy of 10%
+    use_secondary_yaxis=True,
+    x_max=args.epochs * 10_000,
+    labels={"x": "Num examples seen", "y1": "Cross entropy loss", "y2": "Test Accuracy"},
+    title="ResNet Feature Extraction",
+    width=800,
+)
+# %%
+test_input = t.tensor(
+    [
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+        [10, 11, 12, 13, 14],
+        [15, 16, 17, 18, 19],
+    ],
+    dtype=t.float,
+)
+TestCase = namedtuple("TestCase", ["output", "size", "stride"])
+
+test_cases = [
+    # Example 1
+    TestCase(
+        output=t.tensor([0, 1, 2, 3]),
+        size=(4,),
+        stride=(1,),
+    ),
+    # Example 2
+    TestCase(
+        output=t.tensor([[0, 2], [5, 7]]),
+        size=(2, 2),
+        stride=(5, 2),
+    ),
+    # Start of exercises (you should fill in size & stride for all 6 of these):
+    TestCase(
+        output=t.tensor([0, 1, 2, 3, 4]),
+        size=(5,),
+        stride=(1,),
+    ),
+    TestCase(
+        output=t.tensor([0, 5, 10, 15]),
+        size=(4,),
+        stride=(5,),
+    ),
+    TestCase(
+        output=t.tensor([[0, 1, 2], [5, 6, 7]]),
+        size=(2,3),
+        stride=(5,1),
+    ),
+    TestCase(
+        output=t.tensor([[0, 1, 2], [10, 11, 12]]),
+        size=(2,3),
+        stride=(10,1),
+    ),
+    TestCase(
+        output=t.tensor([[0, 0, 0], [11, 11, 11]]),
+        size=(2,3),
+        stride=(11,0),
+    ),
+    TestCase(
+        output=t.tensor([0, 6, 12, 18]),
+        size=(4,),
+        stride=(6,),
+    ),
+]
+
+
+for i, test_case in enumerate(test_cases):
+    if (test_case.size is None) or (test_case.stride is None):
+        print(f"Test {i} failed: attempt missing.")
+    else:
+        actual = test_input.as_strided(size=test_case.size, stride=test_case.stride)
+        if (test_case.output != actual).any():
+            print(f"Test {i} failed\n  Expected: {test_case.output}\n  Actual: {actual}")
+# %%
